@@ -1,0 +1,22 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "ore-claude",
+  "description": "おれのClaude、おまえのClaude — Claude Code設定バトル",
+  "owner": {
+    "name": "mii012345",
+    "email": "y.tanezaki@seeda.fun"
+  },
+  "plugins": [
+    {
+      "name": "ore-claude",
+      "description": "Claude Code設定をスコアリングしてリーダーボードでバトル。設定の中身は一切外部に送信されません。",
+      "source": "./plugins/ore-claude",
+      "category": "productivity",
+      "author": {
+        "name": "mii012345"
+      },
+      "version": "0.1.0",
+      "keywords": ["scoring", "leaderboard", "battle", "config"]
+    }
+  ]
+}

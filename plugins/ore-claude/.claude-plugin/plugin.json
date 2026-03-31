@@ -1,0 +1,9 @@
+{
+  "name": "ore-claude",
+  "description": "おれのClaude、おまえのClaude — Claude Code設定をスコアリングしてリーダーボードでバトル",
+  "version": "0.1.0",
+  "author": {
+    "name": "mii012345"
+  },
+  "keywords": ["scoring", "leaderboard", "battle", "config", "mcp"]
+}
