@@ -1,10 +1,40 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join, basename } from "node:path";
-import { homedir } from "node:os";
+import { homedir, platform } from "node:os";
 import { execSync } from "node:child_process";
 import type { ScanResult } from "./types.js";
 
 const CLAUDE_DIR = join(homedir(), ".claude");
+const IS_WINDOWS = platform() === "win32";
+
+/**
+ * ~/.claude/projects/ のディレクトリ名から実際のファイルシステムパスを復元する。
+ * Windows: "-C-u_temp-project" → "C:/u_temp/project"
+ * Unix:    "-home-yuto-foo"    → "/home/yuto/foo"
+ */
+function restoreProjectPath(dirName: string): string {
+  if (IS_WINDOWS) {
+    // Windows: 先頭の "-" を除去し、最初の区切りをドライブレターとして扱う
+    // "-C-u_temp-project" → "C-u_temp-project" → "C:/u_temp/project"
+    const stripped = dirName.replace(/^-/, "");
+    const drive = stripped.charAt(0);
+    const rest = stripped.slice(1).replace(/-/g, "/");
+    return `${drive}:${rest}`;
+  }
+  // Unix: "-home-yuto-foo" → "/home/yuto/foo"
+  return dirName.replace(/^-/, "/").replace(/-/g, "/");
+}
+
+/**
+ * ローカルタイムゾーンの日付文字列を返す (YYYY-MM-DD)
+ */
+function toLocalDateString(ms: number): string {
+  const d = new Date(ms);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
 
 async function exists(path: string): Promise<boolean> {
   try {
@@ -63,8 +93,13 @@ async function listFiles(path: string): Promise<string[]> {
 // ── CLAUDE.md スキャン ──
 
 async function scanClaudeMd(): Promise<ScanResult["claudeMd"]> {
-  const globalPath = join(homedir(), "CLAUDE.md");
-  const globalExists = await exists(globalPath);
+  // グローバル CLAUDE.md: ~/CLAUDE.md と ~/.claude/CLAUDE.md の両方をチェック
+  const globalPathHome = join(homedir(), "CLAUDE.md");
+  const globalPathDotClaude = join(CLAUDE_DIR, "CLAUDE.md");
+  const homeExists = await exists(globalPathHome);
+  const dotClaudeExists = await exists(globalPathDotClaude);
+  const globalExists = homeExists || dotClaudeExists;
+  const globalPath = homeExists ? globalPathHome : globalPathDotClaude;
   const globalLineCount = globalExists ? await countLines(globalPath) : 0;
   const globalSectionCount = globalExists ? await countSections(globalPath) : 0;
 
@@ -75,8 +110,8 @@ async function scanClaudeMd(): Promise<ScanResult["claudeMd"]> {
   let projectConfigs = 0;
 
   for (const proj of projects) {
-    // ディレクトリ名 "-home-yuto-foo" → "/home/yuto/foo"
-    const realPath = proj.replace(/^-/, "/").replace(/-/g, "/");
+    // クロスプラットフォーム対応のパス復元
+    const realPath = restoreProjectPath(proj);
     if (await exists(join(realPath, "CLAUDE.md"))) {
       projectConfigs++;
     }
@@ -86,13 +121,10 @@ async function scanClaudeMd(): Promise<ScanResult["claudeMd"]> {
     }
   }
 
-  // 追加: find で ~/以下のCLAUDE.mdも拾う（上記で漏れるサブディレクトリ対応）
+  // 追加: ~/以下のCLAUDE.mdも拾う（上記で漏れるサブディレクトリ対応）
+  // Node.js で再帰的に検索し、find コマンドに依存しない
   try {
-    const result = execSync(
-      `find "${homedir()}" -maxdepth 3 -name "CLAUDE.md" -not -path "*/.claude/*" -not -path "*/node_modules/*" 2>/dev/null | wc -l`,
-      { encoding: "utf-8", timeout: 5000 }
-    ).trim();
-    const found = parseInt(result) || 0;
+    const found = await findClaudeMdFiles(homedir(), 3);
     if (found > projectConfigs) {
       projectConfigs = found;
     }
@@ -101,6 +133,37 @@ async function scanClaudeMd(): Promise<ScanResult["claudeMd"]> {
   }
 
   return { globalExists, globalLineCount, globalSectionCount, projectConfigs };
+}
+
+/**
+ * 指定ディレクトリから maxDepth 階層まで CLAUDE.md を再帰検索する（Node.js実装）。
+ * .claude/, node_modules/ は除外。
+ */
+async function findClaudeMdFiles(
+  dir: string,
+  maxDepth: number,
+  currentDepth = 0
+): Promise<number> {
+  if (currentDepth > maxDepth) return 0;
+  let count = 0;
+  try {
+    const entries = await readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isFile() && entry.name === "CLAUDE.md") {
+        count++;
+      } else if (entry.isDirectory()) {
+        if (entry.name === ".claude" || entry.name === "node_modules") continue;
+        count += await findClaudeMdFiles(
+          join(dir, entry.name),
+          maxDepth,
+          currentDepth + 1
+        );
+      }
+    }
+  } catch {
+    // 権限エラー等はスキップ
+  }
+  return count;
 }
 
 // ── Hooks スキャン ──
@@ -261,7 +324,7 @@ async function scanUsage(): Promise<ScanResult["usage"]> {
     try {
       const s = await stat(join(sessionEnvDir, sess));
       if (s.mtimeMs >= thirtyDaysAgo) {
-        const day = new Date(s.mtimeMs).toISOString().slice(0, 10);
+        const day = toLocalDateString(s.mtimeMs);
         activeDays.add(day);
       }
     } catch {
@@ -283,27 +346,29 @@ async function scanUsage(): Promise<ScanResult["usage"]> {
   }
 
   // Claude コミット数（直近のリポジトリで）
+  // ~/.claude/projects/ のディレクトリ名からリポジトリパスを復元して検索（クロスプラットフォーム対応）
   let claudeCommitCount = 0;
-  try {
-    const result = execSync(
-      'find ~ -maxdepth 2 -name ".git" -type d 2>/dev/null | head -20',
-      { encoding: "utf-8", timeout: 5000 }
-    );
-    const gitDirs = result.trim().split("\n").filter(Boolean);
-    for (const gitDir of gitDirs) {
-      try {
-        const repoDir = gitDir.replace(/\/.git$/, "");
-        const count = execSync(
-          `git -C "${repoDir}" log --all --oneline --grep="Co-Authored-By:" --since="30 days ago" 2>/dev/null | wc -l`,
-          { encoding: "utf-8", timeout: 3000 }
-        ).trim();
-        claudeCommitCount += parseInt(count) || 0;
-      } catch {
-        // skip
+  const scannedRepoPaths = new Set<string>();
+
+  for (const proj of projects) {
+    try {
+      const repoDir = restoreProjectPath(proj);
+      // 同じリポジトリを重複スキャンしない
+      if (scannedRepoPaths.has(repoDir)) continue;
+      scannedRepoPaths.add(repoDir);
+
+      if (!(await exists(join(repoDir, ".git")))) continue;
+
+      const result = execSync(
+        `git -C "${repoDir}" log --all --oneline --grep="Co-Authored-By:" --since="30 days ago"`,
+        { encoding: "utf-8", timeout: 3000, stdio: ["pipe", "pipe", "pipe"] }
+      ).trim();
+      if (result) {
+        claudeCommitCount += result.split("\n").filter(Boolean).length;
       }
+    } catch {
+      // skip
     }
-  } catch {
-    // skip
   }
 
   // チャネル統合
